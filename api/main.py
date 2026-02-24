@@ -1,11 +1,13 @@
 """FastAPI应用主入口"""
-from fastapi import FastAPI, HTTPException
+import os
+import re
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from typing import List, Optional, Dict, Any
 import uvicorn
 
-from config import KeyManager, get_default_config
+from config import KeyManager, get_default_config, config as app_config
 from scenarios import (
     PropertyChatbotService,
     WorkOrderAIService,
@@ -15,6 +17,20 @@ from scenarios import (
 from services import ChatService, RAGService
 from utils import default_logger
 
+# CORS 配置
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:8080",
+    "http://localhost:8000",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:8000",
+]
+# 从环境变量读取额外的 CORS 来源（逗号分隔）
+CORS_ORIGINS = DEFAULT_CORS_ORIGINS.copy()
+if os.getenv("CORS_ORIGINS"):
+    CORS_ORIGINS.extend([origin.strip() for origin in os.getenv("CORS_ORIGINS").split(",")])
+
 # 创建FastAPI应用
 app = FastAPI(
     title="物业大模型应用平台 API",
@@ -22,24 +38,45 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# 添加CORS中间件
+# 添加CORS中间件（生产环境禁用credentials通配符）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True if app_config.env.value != "production" else False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
 # ==================== 请求/响应模型 ====================
 
+def _sanitize_error(error: Exception) -> str:
+    """清理错误消息，移除敏感信息"""
+    error_str = str(error)
+    # 移除可能的 API key
+    import re
+    error_str = re.sub(r'sk-[a-zA-Z0-9]{20,}', '[API_KEY_HIDDEN]', error_str)
+    # 移除可能的密钥
+    error_str = re.sub(r'[a-zA-Z0-9]{32,64}', '[KEY_HIDDEN]', error_str)
+    # 生产环境返回通用消息
+    if app_config.env.value == "production":
+        return "服务器内部错误，请稍后重试"
+    return error_str
+
+
 class ChatRequest(BaseModel):
     """聊天请求"""
-    message: str = Field(..., description="用户消息")
-    session_id: Optional[str] = Field(default="default", description="会话ID")
-    temperature: Optional[float] = Field(default=0.7, description="温度参数")
+    message: str = Field(..., description="用户消息", min_length=1, max_length=10000)
+    session_id: Optional[str] = Field(default="default", description="会话ID", max_length=64)
+    temperature: Optional[float] = Field(default=0.7, description="温度参数", ge=0, le=2)
     history: Optional[List[Dict]] = Field(default=None, description="历史消息")
+
+    @validator('session_id')
+    def validate_session_id(cls, v):
+        """验证 session_id 格式"""
+        if v and not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError('session_id 只能包含字母、数字、下划线和连字符')
+        return v
 
 
 class ChatResponse(BaseModel):
@@ -53,7 +90,7 @@ class ChatResponse(BaseModel):
 
 class WorkOrderProcessRequest(BaseModel):
     """工单处理请求"""
-    content: str = Field(..., description="工单内容")
+    content: str = Field(..., description="工单内容", min_length=1, max_length=5000)
     provider: Optional[str] = Field(default="deepseek", description="模型提供商")
     model: Optional[str] = Field(default=None, description="模型名称")
 
@@ -67,7 +104,7 @@ class WorkOrderProcessResponse(BaseModel):
 
 class ContractAuditRequest(BaseModel):
     """合同审核请求"""
-    content: str = Field(..., description="合同内容")
+    content: str = Field(..., description="合同内容", min_length=1, max_length=20000)
     provider: Optional[str] = Field(default="qianwen", description="模型提供商")
     model: Optional[str] = Field(default=None, description="模型名称")
 
@@ -81,8 +118,8 @@ class ContractAuditResponse(BaseModel):
 
 class KnowledgeQueryRequest(BaseModel):
     """知识库问答请求"""
-    question: str = Field(..., description="问题")
-    knowledge: Optional[List[str]] = Field(default=None, description="知识库内容")
+    question: str = Field(..., description="问题", min_length=1, max_length=500)
+    knowledge: Optional[List[str]] = Field(default=None, description="知识库内容", max_length=100)
 
 
 class KnowledgeQueryResponse(BaseModel):
@@ -171,12 +208,18 @@ async def chat(request: ChatRequest):
             session_id=request.session_id
         )
         return ChatResponse(**result)
+    except ValueError as e:
+        # 客户端错误（如配置问题）
+        default_logger.warning(f"Chat validation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_sanitize_error(e)
+        )
     except Exception as e:
         default_logger.error(f"Chat error: {str(e)}")
-        return ChatResponse(
-            success=False,
-            error=str(e),
-            session_id=request.session_id
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_sanitize_error(e)
         )
 
 
@@ -185,7 +228,14 @@ async def chat_stream(request: ChatRequest):
     """流式对话接口"""
     from fastapi.responses import StreamingResponse
 
-    service = get_chatbot_service()
+    try:
+        service = get_chatbot_service()
+    except Exception as e:
+        default_logger.error(f"Chat stream init error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_sanitize_error(e)
+        )
 
     async def generate():
         try:
@@ -195,7 +245,8 @@ async def chat_stream(request: ChatRequest):
             ):
                 yield f"data: {chunk}\n\n"
         except Exception as e:
-            yield f"data: Error: {str(e)}\n\n"
+            default_logger.error(f"Chat stream error: {str(e)}")
+            yield f"data: [ERROR] {_sanitize_error(e)}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -206,9 +257,22 @@ async def chat_stream(request: ChatRequest):
 @app.delete("/chat/session/{session_id}")
 async def clear_session(session_id: str):
     """清除会话"""
-    service = get_chatbot_service()
-    service.clear_session(session_id)
-    return {"success": True, "message": f"Session {session_id} cleared"}
+    # 验证 session_id 格式
+    if not re.match(r'^[a-zA-Z0-9_-]+$', session_id) or len(session_id) > 64:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="无效的 session_id 格式"
+        )
+    try:
+        service = get_chatbot_service()
+        service.clear_session(session_id)
+        return {"success": True, "message": f"Session {session_id} cleared"}
+    except Exception as e:
+        default_logger.error(f"Clear session error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_sanitize_error(e)
+        )
 
 
 # ==================== 工单处理API ====================
@@ -220,11 +284,17 @@ async def process_workorder(request: WorkOrderProcessRequest):
         service = get_workorder_service()
         result = service.process(request.content)
         return WorkOrderProcessResponse(**result)
+    except ValueError as e:
+        default_logger.warning(f"Workorder validation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_sanitize_error(e)
+        )
     except Exception as e:
         default_logger.error(f"Workorder process error: {str(e)}")
-        return WorkOrderProcessResponse(
-            success=False,
-            error=str(e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_sanitize_error(e)
         )
 
 
@@ -237,11 +307,17 @@ async def audit_contract(request: ContractAuditRequest):
         service = get_contract_service()
         result = service.audit(request.content)
         return ContractAuditResponse(**result)
+    except ValueError as e:
+        default_logger.warning(f"Contract validation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_sanitize_error(e)
+        )
     except Exception as e:
         default_logger.error(f"Contract audit error: {str(e)}")
-        return ContractAuditResponse(
-            success=False,
-            error=str(e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_sanitize_error(e)
         )
 
 
@@ -257,11 +333,17 @@ async def query_knowledge(request: KnowledgeQueryRequest):
         )
         result = service.query(request.question)
         return KnowledgeQueryResponse(**result)
+    except ValueError as e:
+        default_logger.warning(f"Knowledge query validation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_sanitize_error(e)
+        )
     except Exception as e:
         default_logger.error(f"Knowledge query error: {str(e)}")
-        return KnowledgeQueryResponse(
-            success=False,
-            error=str(e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_sanitize_error(e)
         )
 
 
@@ -306,12 +388,18 @@ async def llm_chat(request: LLMChatRequest):
             "model": response.model,
             "usage": response.usage
         }
+    except ValueError as e:
+        default_logger.warning(f"LLM chat validation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_sanitize_error(e)
+        )
     except Exception as e:
         default_logger.error(f"LLM chat error: {str(e)}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_sanitize_error(e)
+        )
 
 
 # ==================== 启动入口 ====================

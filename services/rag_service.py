@@ -27,49 +27,73 @@ class RAGService:
             self._process_knowledge_base()
 
     def _process_knowledge_base(self):
-        """处理知识库"""
+        """处理知识库，分块并预计算 embedding"""
         self._chunks = []
+        self._chunk_embeddings = []
         splitter = TextSplitter()
 
         for doc in self.knowledge_base:
             chunks = splitter.split_by_chars(doc, chunk_size=500, overlap=50)
             self._chunks.extend(chunks)
 
-        default_logger.info(f"Knowledge base processed: {len(self._chunks)} chunks")
+        # 预计算所有 chunk 的 embedding（批量处理以提高性能）
+        if self._chunks:
+            try:
+                self._chunk_embeddings = self.embedding_service.embed_batch(self._chunks)
+                default_logger.info(f"Knowledge base processed: {len(self._chunks)} chunks with embeddings")
+            except Exception as e:
+                default_logger.error(f"Failed to compute embeddings: {e}")
+                self._chunk_embeddings = []
 
     def add_document(self, document: str):
         """添加文档"""
         splitter = TextSplitter()
         chunks = splitter.split_by_chars(document, chunk_size=500, overlap=50)
-        self._chunks.extend(chunks)
-        default_logger.info(f"Document added: {len(chunks)} chunks")
+
+        if chunks:
+            # 计算新 chunks 的 embeddings
+            try:
+                embeddings = self.embedding_service.embed_batch(chunks)
+                self._chunks.extend(chunks)
+                self._chunk_embeddings.extend(embeddings)
+                default_logger.info(f"Document added: {len(chunks)} chunks with embeddings")
+            except Exception as e:
+                default_logger.error(f"Failed to compute embeddings for new document: {e}")
 
     def retrieve(self, query: str, top_k: int = None) -> List[Dict[str, Any]]:
-        """检索相关文档"""
+        """检索相关文档
+
+        使用预计算的 chunk embeddings 进行相似度检索，避免每次查询都调用 API。
+        """
         if not self._chunks:
             return []
+
+        if not self._chunk_embeddings or len(self._chunk_embeddings) != len(self._chunks):
+            # 如果没有预计算的 embeddings，回退到逐个计算（性能较差）
+            default_logger.warning("No pre-computed embeddings found, falling back to on-the-fly computation")
+            self._chunk_embeddings = self.embedding_service.embed_batch(self._chunks)
 
         k = top_k or self.top_k
 
         # 获取查询向量
         query_embedding = self.embedding_service.embed(query)
 
-        # 简单相似度计算
+        # 使用预计算的 embeddings 进行相似度计算
         similarities = []
-        for i, chunk in enumerate(self._chunks):
-            chunk_embedding = self.embedding_service.embed(chunk)
+        for i, chunk_embedding in enumerate(self._chunk_embeddings):
             similarity = self._cosine_similarity(query_embedding, chunk_embedding)
             similarities.append((i, similarity))
 
-        # 排序并取top_k
+        # 排序并取 top_k
         similarities.sort(key=lambda x: x[1], reverse=True)
-        top_indices = [idx for idx, _ in similarities[:k]]
+        top_k_items = similarities[:k]
 
+        # 构建结果（修复：从排序后的列表中直接获取分数，而不是用原索引）
         results = []
-        for idx in top_indices:
+        for idx, score in top_k_items:
             results.append({
                 "chunk": self._chunks[idx],
-                "score": similarities[idx][1],
+                "score": score,
                 "index": idx
             })
 
